@@ -233,3 +233,6 @@ configs/development.yaml
 Dockerfile.dev
 discussion
 tmp_test
+
+
+*.pdf
