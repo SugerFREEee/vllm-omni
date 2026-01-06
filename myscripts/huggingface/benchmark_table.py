@@ -338,7 +338,7 @@ def main():
     parser.add_argument(
         '--model-path',
         type=str,
-        default='/data/workspace/model/FunAudioLLM/Fun-CosyVoice3-0.5B-2512/flow.pt',
+        default='/home/wjs/workspace/model/FunAudioLLM/Fun-CosyVoice3-0.5B-2512/flow.pt',
         help='Path to flow.pt'
     )
     parser.add_argument(
