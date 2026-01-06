@@ -341,6 +341,80 @@ def enable_cache_for_sd3(pipeline: Any, cache_config: Any) -> Callable[[int], No
     return refresh_cache_context
 
 
+def enable_cache_for_cosyvoice3(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
+    """Enable cache-dit for CosyVoice3 DiT architecture.
+
+    CosyVoice3 uses a single transformer (pipeline.transformer) with blocks
+    that need to be enabled using BlockAdapter.
+
+    Args:
+        pipeline: The CosyVoice3 pipeline instance.
+        cache_config: DiffusionCacheConfig instance with cache configuration.
+
+    Returns:
+        A refresh function that can be called to update cache context with new num_inference_steps.
+    """
+    # Build DBCacheConfig for transformer
+    db_cache_config = _build_db_cache_config(cache_config)
+
+    calibrator = None
+    if cache_config.enable_taylorseer:
+        taylorseer_order = cache_config.taylorseer_order
+        calibrator = TaylorSeerCalibratorConfig(taylorseer_order=taylorseer_order)
+        logger.info(f"TaylorSeer enabled with order={taylorseer_order}")
+
+    # Build ParamsModifier for transformer
+    modifier = ParamsModifier(
+        cache_config=db_cache_config,
+        calibrator_config=calibrator,
+    )
+
+    logger.info(
+        f"Enabling cache-dit on CosyVoice3 transformer with BlockAdapter: "
+        f"Fn={db_cache_config.Fn_compute_blocks}, "
+        f"Bn={db_cache_config.Bn_compute_blocks}, "
+        f"W={db_cache_config.max_warmup_steps}, "
+    )
+
+    # Enable cache-dit using BlockAdapter for transformer
+    cache_dit.enable_cache(
+        (
+            BlockAdapter(
+                transformer=pipeline.transformer,
+                blocks=pipeline.transformer.blocks,
+                forward_pattern=ForwardPattern.Pattern_3,
+                params_modifiers=[modifier],
+            )
+        ),
+        cache_config=db_cache_config,
+    )
+
+    def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
+        """Refresh cache context for the transformer with new num_inference_steps.
+
+        Args:
+            pipeline: The CosyVoice3 pipeline instance.
+            num_inference_steps: New number of inference steps.
+        """
+        if cache_config.scm_steps_mask_policy is None:
+            cache_dit.refresh_context(pipeline.transformer, num_inference_steps=num_inference_steps, verbose=verbose)
+        else:
+            cache_dit.refresh_context(
+                pipeline.transformer,
+                cache_config=DBCacheConfig().reset(
+                    num_inference_steps=num_inference_steps,
+                    steps_computation_mask=cache_dit.steps_mask(
+                        mask_policy=cache_config.scm_steps_mask_policy,
+                        total_steps=num_inference_steps,
+                    ),
+                    steps_computation_policy=cache_config.scm_steps_policy,
+                ),
+                verbose=verbose,
+            )
+
+    return refresh_cache_context
+
+
 def enable_cache_for_dit(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
     """Enable cache-dit for regular single-transformer DiT models.
 
@@ -409,6 +483,7 @@ CUSTOM_DIT_ENABLERS.update(
         "LongcatImagePipeline": enable_cache_for_longcat_image,
         "LongcatImageEditPipeline": enable_cache_for_longcat_image,
         "StableDiffusion3Pipeline": enable_cache_for_sd3,
+        "CosyVoice3Pipeline": enable_cache_for_cosyvoice3,
     }
 )
 

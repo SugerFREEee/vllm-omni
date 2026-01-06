@@ -70,14 +70,21 @@ class CosyVoice3DiTVllm(nn.Module):
                 BlockAdapter,
                 ForwardPattern,
                 DBCacheConfig,
-                TaylorSeerCalibratorConfig
+                TaylorSeerCalibratorConfig,
             )
+            from cache_dit.caching.block_adapters import FakeDiffusionPipeline
 
             print(f"[CosyVoice3] Setting up cache-dit acceleration...")
 
-            # Create BlockAdapter
+            # Create a dedicated FakeDiffusionPipeline subclass per model so cache-dit's
+            # class-level _is_cached flag does not leak across instances.
+            class CosyVoiceFakePipeline(FakeDiffusionPipeline):
+                pass
+
+            fake_pipe = CosyVoiceFakePipeline(transformer=self.dit)
+
             self.cache_adapter = BlockAdapter(
-                pipe=None,  # Transformer-only interface
+                pipe=fake_pipe,
                 transformer=self.dit,
                 blocks=self.dit.blocks,
                 forward_pattern=ForwardPattern.Pattern_3,  # Single input/output
@@ -168,7 +175,7 @@ class CosyVoice3DiTVllm(nn.Module):
             import cache_dit
             steps = num_inference_steps or self.config.num_inference_steps
             cache_dit.refresh_context(
-                self.cache_adapter,
+                self.dit,  # Pass the transformer model instead of BlockAdapter
                 num_inference_steps=steps,
                 verbose=False
             )

@@ -69,6 +69,11 @@ _DIFFUSION_MODELS = {
         "pipeline_sd3",
         "StableDiffusion3Pipeline",
     ),
+    "CosyVoice3Pipeline": (
+        "cosyvoice3",
+        "pipeline_cosyvoice3",
+        "CosyVoice3Pipeline",
+    ),
 }
 
 

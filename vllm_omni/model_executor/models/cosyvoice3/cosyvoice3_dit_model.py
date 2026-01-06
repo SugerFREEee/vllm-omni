@@ -17,9 +17,10 @@ class SinusoidalPosEmb(nn.Module):
 
     def forward(self, x):
         device = x.device
+        dtype = x.dtype
         half_dim = self.dim // 2
         emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
+        emb = torch.exp(torch.arange(half_dim, device=device, dtype=dtype) * -emb)
         emb = x[:, None] * emb[None, :]
         emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
         return emb
@@ -186,8 +187,14 @@ class CosyVoice3DiT(nn.Module):
         Returns:
             Output tensor [B, T, out_channels]
         """
+        # Align dtype for timesteps/time embedding to match hidden states
+        if timesteps.dtype != x.dtype:
+            timesteps = timesteps.to(dtype=x.dtype)
+
         # Get time embedding
         t_emb = self.time_embed(timesteps)  # [B, dim]
+        if t_emb.dtype != x.dtype:
+            t_emb = t_emb.to(dtype=x.dtype)
         t_emb = t_emb.unsqueeze(1)  # [B, 1, dim]
 
         # Concatenate inputs
