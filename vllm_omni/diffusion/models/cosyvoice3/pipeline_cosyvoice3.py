@@ -1,4 +1,8 @@
-"""Minimal CosyVoice3 DiT pipeline for Omni diffusion benchmarks."""
+"""Minimal CosyVoice3 DiT pipeline for Omni diffusion benchmarks.
+
+Real inference mode implements CosyVoice3's CFM (flow matching) Euler solver with
+classifier-free guidance, matching `cosyvoice/flow/flow_matching.py`.
+"""
 
 import os
 import time
@@ -53,7 +57,8 @@ class CosyVoice3Pipeline(nn.Module):
 
         flow_path = self._resolve_flow_path(od_config.model)
         self.model = CosyVoice3DiTVllm.from_pretrained(flow_path, config=self.model_config)
-        self.model = self.model.to(device=self.device, dtype=od_config.dtype)
+        # Force float32 for stability and to match CosyVoice reference implementation.
+        self.model = self.model.to(device=self.device, dtype=torch.float32)
         self.model.eval()
         self.transformer = self.model.dit
         self.vae = _DummyVAE()
@@ -64,6 +69,23 @@ class CosyVoice3Pipeline(nn.Module):
         self.default_seq_len = tf_params.get("seq_len", 200)
         self.default_batch_size = tf_params.get("batch_size", 1)
         self.default_num_warmup = tf_params.get("num_warmup", 0)
+
+        # Match CosyVoice3 `cfm_params.content` defaults from the shipped cosyvoice3.yaml.
+        self._t_scheduler = tf_params.get("t_scheduler", "cosine")
+        self._inference_cfg_rate = float(tf_params.get("inference_cfg_rate", 0.7))
+
+        # Match `CausalConditionalCFM` deterministic noise (seed=0, shape [1,80,50*300]).
+        gen = torch.Generator(device=self.device).manual_seed(0)
+        self.register_buffer(
+            "_rand_noise",
+            torch.randn(
+                (1, self.model_config.mel_dim, 50 * 300),
+                generator=gen,
+                device=self.device,
+                dtype=torch.float32,
+            ),
+            persistent=False,
+        )
 
     @staticmethod
     def _resolve_flow_path(model_path: str) -> str:
@@ -89,6 +111,20 @@ class CosyVoice3Pipeline(nn.Module):
         return 0
 
     def forward(self, request: OmniDiffusionRequest) -> DiffusionOutput:
+        extra = request.extra or {}
+
+        # Check if this is a real inference request or benchmark
+        is_benchmark = extra.get("benchmark_mode", False)
+
+        if is_benchmark:
+            # Original benchmark mode
+            return self._forward_benchmark(request)
+        else:
+            # Real inference mode
+            return self._forward_inference(request)
+
+    def _forward_benchmark(self, request: OmniDiffusionRequest) -> DiffusionOutput:
+        """Original benchmark implementation"""
         extra = request.extra or {}
         batch_size = int(extra.get("batch_size", self.default_batch_size))
         seq_len = int(extra.get("seq_len", self.default_seq_len))
@@ -164,3 +200,103 @@ class CosyVoice3Pipeline(nn.Module):
             }
         ]
         return DiffusionOutput(output=payload)
+
+    def _forward_inference(self, request: OmniDiffusionRequest) -> DiffusionOutput:
+        """Real inference implementation using actual DiT diffusion
+
+        CosyVoice uses Conditional Flow Matching (CFM), where the ODE starts from
+        the condition mu (not random noise) and flows to the target mel spectrogram.
+        """
+        extra = request.extra or {}
+
+        # Extract real inputs from extra (all in [batch, dim, seq] format from cosy_server)
+        # - condition_vector corresponds to `mu` in CosyVoice CFM (encoder output)
+        # - cond corresponds to prompt mel + zeros (conditioning)
+        mu = extra.get("condition_vector")  # [batch, mel_dim, seq]
+        spks = extra.get("speaker_embedding")  # [batch, spk_dim]
+        cond = extra.get("cond")  # [batch, mel_dim, seq]
+        seq_len = extra.get("seq_len")
+        batch_size = extra.get("batch_size", 1)
+
+        if mu is None or spks is None or cond is None:
+            raise ValueError("condition_vector, speaker_embedding, and cond must be provided in extra for real inference")
+
+        # Convert to tensors (float32 only)
+        if not isinstance(mu, torch.Tensor):
+            mu = torch.tensor(mu, dtype=torch.float32)
+        if not isinstance(spks, torch.Tensor):
+            spks = torch.tensor(spks, dtype=torch.float32)
+        if not isinstance(cond, torch.Tensor):
+            cond = torch.tensor(cond, dtype=torch.float32)
+
+        mu = mu.to(self.device, dtype=torch.float32)
+        spks = spks.to(self.device, dtype=torch.float32)
+        cond = cond.to(self.device, dtype=torch.float32)
+
+        if mu.dim() == 2:
+            mu = mu.unsqueeze(0)
+        if spks.dim() == 1:
+            spks = spks.unsqueeze(0)
+        if cond.dim() == 2:
+            cond = cond.unsqueeze(0)
+
+        if seq_len is None:
+            seq_len = int(mu.shape[2])
+
+        num_steps = int(request.num_inference_steps or self.model_config.num_inference_steps)
+
+        # Build t_span in [0,1], then apply cosine scheduler if configured.
+        t_span = torch.linspace(0.0, 1.0, num_steps + 1, device=self.device, dtype=torch.float32)
+        if self._t_scheduler == "cosine":
+            t_span = 1.0 - torch.cos(t_span * 0.5 * torch.pi)
+
+        # Deterministic initial noise (matches `CausalConditionalCFM.rand_noise` usage).
+        z = self._rand_noise[:, :, :seq_len].to(self.device)
+
+        # Full-length mask (no padding). Match CosyVoice mask shape (B, 1, T).
+        mask = torch.ones((batch_size, 1, seq_len), device=self.device, dtype=torch.float32)
+
+        # Euler solver with classifier-free guidance:
+        # run estimator on batch=2, where the second sample has mu/spks/cond dropped.
+        x = z.expand(batch_size, -1, -1).contiguous()
+
+        # Pre-allocate inputs to match CosyVoice memory layout constraints.
+        x_in = torch.zeros((2 * batch_size, self.model_config.mel_dim, seq_len), device=self.device, dtype=torch.float32)
+        mask_in = torch.zeros((2 * batch_size, 1, seq_len), device=self.device, dtype=torch.float32)
+        mu_in = torch.zeros((2 * batch_size, self.model_config.mel_dim, seq_len), device=self.device, dtype=torch.float32)
+        t_in = torch.zeros((2 * batch_size,), device=self.device, dtype=torch.float32)
+        spks_in = torch.zeros((2 * batch_size, self.model_config.mel_dim), device=self.device, dtype=torch.float32)
+        cond_in = torch.zeros((2 * batch_size, self.model_config.mel_dim, seq_len), device=self.device, dtype=torch.float32)
+
+        t = t_span[0]
+        dt = (t_span[1] - t_span[0]).item()
+
+        with torch.no_grad():
+            for step in range(1, len(t_span)):
+                x_in[:] = x.repeat(2, 1, 1)
+                mask_in[:] = mask.repeat(2, 1, 1)
+                mu_in[:batch_size] = mu
+                spks_in[:batch_size] = spks
+                cond_in[:batch_size] = cond
+                t_in[:] = t
+
+                # Call the real DiT estimator (signature matches CosyVoice).
+                dphi_dt = self.model.dit(
+                    x=x_in,
+                    mask=mask_in,
+                    mu=mu_in,
+                    t=t_in,
+                    spks=spks_in,
+                    cond=cond_in,
+                    streaming=False,
+                )
+
+                guided, cfg = torch.split(dphi_dt, [batch_size, batch_size], dim=0)
+                guided = (1.0 + self._inference_cfg_rate) * guided - self._inference_cfg_rate * cfg
+                x = x + dt * guided
+
+                t = t_span[step]
+                if step < len(t_span) - 1:
+                    dt = (t_span[step + 1] - t).item()
+
+        return DiffusionOutput(output=x.float())

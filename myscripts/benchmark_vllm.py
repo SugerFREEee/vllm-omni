@@ -6,7 +6,7 @@ using the new CosyVoice3Pipeline, so cache backends (cache-dit / tea_cache)
 work exactly like the built-in image/video pipelines.
 
 Example:
-    python benchmark_vllm.py --output VLLM_RESULTS.md
+    python myscripts/benchmark_vllm.py --output VLLM_RESULTS.md
 """
 
 import argparse

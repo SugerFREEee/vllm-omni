@@ -381,7 +381,7 @@ def enable_cache_for_cosyvoice3(pipeline: Any, cache_config: Any) -> Callable[[i
         (
             BlockAdapter(
                 transformer=pipeline.transformer,
-                blocks=pipeline.transformer.blocks,
+                blocks=pipeline.transformer.transformer_blocks,  # Real DiT uses transformer_blocks
                 forward_pattern=ForwardPattern.Pattern_3,
                 params_modifiers=[modifier],
             )

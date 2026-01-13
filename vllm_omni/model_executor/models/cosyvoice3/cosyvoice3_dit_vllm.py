@@ -9,13 +9,9 @@ import torch
 import torch.nn as nn
 from typing import Optional
 
-try:
-    from .cosyvoice3_dit_model import CosyVoice3DiT
-    from .cosyvoice3_config import CosyVoice3DiTConfig
-except ImportError:
-    # Fallback for standalone testing
-    from cosyvoice3_dit_model import CosyVoice3DiT
-    from cosyvoice3_config import CosyVoice3DiTConfig
+# Always use relative import since DiT is in the same package
+from .DiT.dit import DiT
+from .cosyvoice3_config import CosyVoice3DiTConfig
 
 
 class CosyVoice3DiTVllm(nn.Module):
@@ -33,17 +29,20 @@ class CosyVoice3DiTVllm(nn.Module):
         super().__init__()
         self.config = config
 
-        # Create standalone DiT model
-        self.dit = CosyVoice3DiT(
+        # Create real DiT model (decoder.estimator)
+        self.dit = DiT(
             dim=config.hidden_size,
             depth=config.num_hidden_layers,
             heads=config.num_attention_heads,
-            dim_head=config.dim_head,
-            ff_mult=config.ff_mult,
+            dim_head=config.hidden_size // config.num_attention_heads,
+            ff_mult=2,  # Checkpoint uses ff_mult=2 (2048 = 1024 * 2)
             mel_dim=config.mel_dim,
-            mu_dim=config.mu_dim,
-            spk_dim=config.spk_dim,
-            out_channels=config.out_channels,
+            mu_dim=config.mel_dim,  # encoder output dim
+            spk_dim=config.mel_dim,  # speaker embedding after affine layer
+            long_skip_connection=False,
+            out_channels=config.mel_dim,
+            static_chunk_size=50,
+            num_decoding_left_chunks=2
         )
 
         # Cache-DiT setup
@@ -86,13 +85,13 @@ class CosyVoice3DiTVllm(nn.Module):
             self.cache_adapter = BlockAdapter(
                 pipe=fake_pipe,
                 transformer=self.dit,
-                blocks=self.dit.blocks,
+                blocks=self.dit.transformer_blocks,  # Real DiT uses transformer_blocks
                 forward_pattern=ForwardPattern.Pattern_3,  # Single input/output
             )
 
             # Configure cache
             cache_config = DBCacheConfig(
-                Fn_compute_blocks=min(self.config.cache_Fn, len(self.dit.blocks)),
+                Fn_compute_blocks=min(self.config.cache_Fn, len(self.dit.transformer_blocks)),
                 Bn_compute_blocks=self.config.cache_Bn,
                 residual_diff_threshold=self.config.cache_threshold,
                 max_warmup_steps=self.config.cache_warmup_steps,
@@ -135,28 +134,52 @@ class CosyVoice3DiTVllm(nn.Module):
         condition_vector: torch.Tensor,
         speaker_embedding: torch.Tensor,
         timesteps: torch.Tensor,
+        cond: torch.Tensor = None,
         **kwargs
     ) -> torch.Tensor:
         """
         Forward pass with vLLM-compatible interface.
 
         Args:
-            hidden_states: [batch, seq_len, mel_dim] - Noised mel features
-            condition_vector: [batch, seq_len, mel_dim] - Condition (mu)
-            speaker_embedding: [batch, seq_len, mel_dim] - Speaker embedding
+            hidden_states: [batch, seq_len, mel_dim] - Noised mel features (x)
+            condition_vector: [batch, seq_len, mel_dim] - Encoder output (mu)
+            speaker_embedding: [batch, seq_len, mel_dim] - Speaker embedding (expanded)
             timesteps: [batch] - Diffusion timesteps (0-1000)
+            cond: [batch, seq_len, mel_dim] - Prompt mel features (optional)
 
         Returns:
-            output: [batch, seq_len, mel_dim] - Predicted noise/velocity
+            output: [batch, seq_len, mel_dim] - Predicted velocity
         """
-        # Input adaptation: vLLM format -> DiT format
-        x = hidden_states
-        mu = condition_vector
-        spk = speaker_embedding
+        # Transpose inputs from [batch, seq, dim] to [batch, dim, seq] for real DiT
+        x = hidden_states.transpose(1, 2)  # [batch, mel_dim, seq]
+        mu = condition_vector.transpose(1, 2)  # [batch, mel_dim, seq]
 
-        # Call standalone DiT
-        output = self.dit(x, timesteps, mu, spk)
+        # Speaker embedding: take first token (they're all the same after expansion)
+        spks = speaker_embedding[:, 0, :]  # [batch, mel_dim]
 
+        if cond is not None:
+            cond = cond.transpose(1, 2)  # [batch, mel_dim, seq]
+        else:
+            # If no cond provided, use zeros
+            cond = torch.zeros_like(x)
+
+        # Create mask: ones for all positions (no masking)
+        batch, _, seq_len = x.shape
+        mask = torch.ones(batch, seq_len, device=x.device, dtype=torch.bool)
+
+        # Call real DiT
+        output = self.dit(
+            x=x,
+            mask=mask,
+            mu=mu,
+            t=timesteps,
+            spks=spks,
+            cond=cond,
+            streaming=False
+        )
+
+        # Transpose output back to [batch, seq, dim]
+        output = output.transpose(1, 2)
         return output
 
     def refresh_cache_context(self, num_inference_steps: Optional[int] = None):
@@ -236,13 +259,27 @@ class CosyVoice3DiTVllm(nn.Module):
 
         model = cls(config)
 
-        # Load weights
-        try:
-            state_dict = torch.load(model_path, map_location='cpu')
-            model.dit.load_state_dict(state_dict, strict=False)
-            print(f"[CosyVoice3] Loaded weights from: {model_path}")
-        except Exception as e:
-            print(f"[CosyVoice3] Failed to load weights: {e}")
-            print(f"[CosyVoice3] Using random initialization")
+        # Load checkpoint
+        print(f"[CosyVoice3] Loading checkpoint from: {model_path}")
+        checkpoint = torch.load(model_path, map_location='cpu')
+
+        # Extract decoder.estimator weights
+        estimator_state_dict = {}
+        for key, value in checkpoint.items():
+            if key.startswith('decoder.estimator.'):
+                # Remove 'decoder.estimator.' prefix
+                new_key = key[len('decoder.estimator.'):]
+                estimator_state_dict[new_key] = value
+
+        print(f"[CosyVoice3] Found {len(estimator_state_dict)} estimator parameters")
+
+        # Load weights into real DiT
+        missing, unexpected = model.dit.load_state_dict(estimator_state_dict, strict=False)
+        if missing:
+            print(f"[CosyVoice3] Missing keys: {len(missing)}")
+        if unexpected:
+            print(f"[CosyVoice3] Unexpected keys: {len(unexpected)}")
+
+        print(f"[CosyVoice3] Successfully loaded real DiT weights!")
 
         return model
