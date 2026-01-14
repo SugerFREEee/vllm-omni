@@ -14,7 +14,8 @@ from torch import nn
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.model_executor.models.cosyvoice3 import CosyVoice3DiTConfig, CosyVoice3DiTVllm
+from .cosyvoice3_config import CosyVoice3DiTConfig
+from .cosyvoice3_dit_vllm import CosyVoice3DiTVllm
 
 
 class _DummyVAE(nn.Module):

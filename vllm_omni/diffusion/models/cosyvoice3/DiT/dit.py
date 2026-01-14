@@ -16,8 +16,8 @@ import torch.nn.functional as F
 from einops import repeat
 from x_transformers.x_transformers import RotaryEmbedding
 
-# Import from copied cosyvoice.utils
-from cosyvoice.utils.mask import add_optional_chunk_mask
+# Import from internal utils
+from ..utils.mask import add_optional_chunk_mask
 
 # Use relative import - modules.py is in the same directory
 from .modules import (
