@@ -3,7 +3,20 @@ python myscripts/vllm_server.py \
   --model-dir /home/wjs/workspace/model/FunAudioLLM/Fun-CosyVoice3-0.5B-2512 \
   --num-steps 10 \
   --host 0.0.0.0 \
-  --port 8001
+  --port 8001 \
+  --disable-cache-dit
+
+python myscripts/vllm_server.py \
+  --model-dir /home/wjs/workspace/model/FunAudioLLM/Fun-CosyVoice3-0.5B-2512 \
+  --num-steps 10 \
+  --host 0.0.0.0 \
+  --port 8001 \
+  --cache-dit-fn 1 \
+  --cache-dit-bn 0 \
+  --cache-dit-residual-threshold 0.4 \
+  --cache-logging off
+
+--cache-logging命令行参数有4种 json,on,return,off。off=禁用缓存统计, return=仅返回缓存信息, on=打印信息并返回, json=打印并写json日志
 """
 
 from __future__ import annotations
@@ -11,6 +24,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -47,10 +61,26 @@ class VLLMRuntime:
         model_dir: str,
         num_steps: int,
         dtype: str,
+        enable_cache_dit: bool = True,
+        cache_dit_fn: int = 8,
+        cache_dit_bn: int = 0,
+        cache_dit_enable_taylorseer: bool = False,
+        cache_dit_taylorseer_order: int = 1,
+        cache_dit_residual_threshold: float = 0.08,
+        enable_cache_logging: Optional[bool] = None,
+        cache_logging_mode: Optional[str] = None,
     ):
         self.model_dir = model_dir
         self.num_steps = num_steps
         self.dtype_str = dtype
+        self.cache_dit_enabled = enable_cache_dit
+        self.cache_dit_fn = cache_dit_fn
+        self.cache_dit_bn = cache_dit_bn
+        self.cache_dit_enable_taylorseer = cache_dit_enable_taylorseer
+        self.cache_dit_taylorseer_order = cache_dit_taylorseer_order
+        self.cache_dit_residual_threshold = cache_dit_residual_threshold
+        self.enable_cache_logging = enable_cache_logging
+        self.cache_logging_mode = cache_logging_mode
 
         # Initialize vllm-omni engine
         print(f"[vllm_server] Initializing vLLM-Omni engine...")
@@ -65,11 +95,31 @@ class VLLMRuntime:
             print(f"[vllm_server] 忽略请求的 dtype={dtype}，强制使用 float32")
         print(f"[vllm_server] 正在使用 dtype: float32")
         
+        # cache-dit 配置 - 确保所有命令行参数都能被正确传递
+        cache_backend = "cache_dit" if self.cache_dit_enabled else "none"
+        cache_config = None
+        if self.cache_dit_enabled:
+            cache_config = {
+                "Fn_compute_blocks": self.cache_dit_fn,
+                "Bn_compute_blocks": self.cache_dit_bn,
+                "residual_diff_threshold": self.cache_dit_residual_threshold,
+                "max_warmup_steps": 0,
+                "max_cached_steps": -1,
+                "max_continuous_cached_steps": num_steps,  # 设置为num_steps允许连续缓存所有步骤
+                "num_inference_steps": num_steps,
+                "enable_taylorseer": self.cache_dit_enable_taylorseer,
+                "taylorseer_order": self.cache_dit_taylorseer_order,
+            }
+        else:
+            print("[vllm_server] cache-dit disabled for this runtime.")
+        
         od_config = OmniDiffusionConfig.from_kwargs(
             model=model_path,
-            cache_backend="cache_dit",
-            cache_config={},
+            cache_backend=cache_backend,
+            cache_config=cache_config,
             dtype=torch_dtype,
+            enable_cache_logging=self.enable_cache_logging,
+            cache_logging_mode=self.cache_logging_mode,
         )
         od_config.model_class_name = "CosyVoice3Pipeline"
 
@@ -86,17 +136,18 @@ class VLLMRuntime:
         od_config.tf_model_config = TransformerConfig.from_dict(tf_cfg)
 
         return OmniDiffusion(od_config=od_config)
-
+    
     def infer(self, payload: DiTInferRequest) -> torch.Tensor:
         """DiT 推理：接收预处理好的 condition_vector 和 speaker_embedding"""
         num_steps = payload.num_inference_steps or self.num_steps
 
-        print(f"[DEBUG] DiT inference")
-        print(f"[DEBUG]   condition_vector shape: {len(payload.condition_vector)}x{len(payload.condition_vector[0])}x{len(payload.condition_vector[0][0])}")
-        print(f"[DEBUG]   speaker_embedding shape: {len(payload.speaker_embedding)}x{len(payload.speaker_embedding[0])}")
-        print(f"[DEBUG]   cond shape: {len(payload.cond)}x{len(payload.cond[0])}x{len(payload.cond[0][0])}")
-        print(f"[DEBUG]   seq_len: {payload.seq_len}, mel_len1: {payload.mel_len1}")
+        # print(f"[DEBUG] DiT inference")
+        # print(f"[DEBUG]   condition_vector shape: {len(payload.condition_vector)}x{len(payload.condition_vector[0])}x{len(payload.condition_vector[0][0])}")
+        # print(f"[DEBUG]   speaker_embedding shape: {len(payload.speaker_embedding)}x{len(payload.speaker_embedding[0])}")
+        # print(f"[DEBUG]   cond shape: {len(payload.cond)}x{len(payload.cond[0])}x{len(payload.cond[0][0])}")
+        # print(f"[DEBUG]   seq_len: {payload.seq_len}, mel_len1: {payload.mel_len1}")
 
+        perf_start = time.perf_counter()
         # Call vllm-omni engine
         output = self.omni.generate(
             prompt="CosyVoice3-RealInference",
@@ -110,40 +161,46 @@ class VLLMRuntime:
                 "benchmark_mode": False,  # 真实推理模式
             },
         )
+        latency = time.perf_counter() - perf_start
+        per_step = latency / num_steps if num_steps else latency
+        print(
+            f"[vllm_server] Inference finished in {latency:.3f}s "
+            f"(~{per_step * 1000:.2f} ms/step for {num_steps} steps)"
+        )
 
         # Extract mel from output
         print(f"[DEBUG] Output type: {type(output)}")
 
         # Handle OmniRequestOutput
         if hasattr(output, 'images') and output.images:
-            print(f"[DEBUG] output.images length: {len(output.images)}")
+            # 虽然我们是生成音频但是 vllm-omni的 diffusion引擎的返回值默认把生产的放入默认的images字段中
             payload_data = output.images[0]
-            print(f"[DEBUG] payload_data type: {type(payload_data)}")
 
-            # Check if it's directly a tensor (our case after modification)
-            if isinstance(payload_data, torch.Tensor):
-                mel_tensor = payload_data
-                print(f"[DEBUG] Got tensor directly! Shape: {mel_tensor.shape}")
-                # Extract only the generated part (exclude prompt)
-                # mel shape: [batch, mel_dim, total_len]
-                mel = mel_tensor[:, :, payload.mel_len1:]
-                print(f"[DEBUG] Generated mel shape: {mel.shape}")
-                return mel.to(dtype=torch.float32)
-            # Or check if it's a dict
-            elif isinstance(payload_data, dict):
-                print(f"[DEBUG] payload_data keys: {list(payload_data.keys())}")
+            if isinstance(payload_data, dict):
                 if "mel" in payload_data:
                     mel_tensor = payload_data["mel"]
-                    if isinstance(mel_tensor, torch.Tensor):
-                        print(f"[DEBUG] Full mel shape: {mel_tensor.shape}")
-                        mel = mel_tensor[:, :, payload.mel_len1:]
-                        print(f"[DEBUG] Generated mel shape: {mel.shape}")
-                        return mel.to(dtype=torch.float32)
+                    
+                    # Extract only the generated part (exclude prompt)
+                    # mel shape: [batch, mel_dim, total_len]
+                    mel = mel_tensor[:, :, payload.mel_len1:]
+                    
+                    # Print cache hit ratio if cached_steps is available
+                    if "cached_steps" in payload_data:
+                        cached_steps = payload_data["cached_steps"]
+                        if cached_steps is not None:
+                            num_steps = payload.num_inference_steps or self.num_steps
+                            cache_hit_ratio = cached_steps / num_steps if num_steps > 0 else 0.0
+                            print(f"[DEBUG] Cache Hit Ratio: {cached_steps}/{num_steps} ({cache_hit_ratio:.2%})")
+                    
+                    return mel.to(dtype=torch.float32)
+            elif isinstance(payload_data, torch.Tensor):
+                # 历史遗留下来的，因为原本payload_data是torch.Tensor，现在改成了 dict
+                # (wjs)TODO:删除这个历史遗留
+                mel_tensor = payload_data
+                mel = mel_tensor[:, :, payload.mel_len1:]
+                return mel.to(dtype=torch.float32)
             else:
                 print(f"[DEBUG] payload_data is PIL Image or other type")
-                # Check if we can access the raw tensor
-                if hasattr(output, '__dict__'):
-                    print(f"[DEBUG] output fields: {list(output.__dict__.keys())}")
 
         raise RuntimeError(f"Failed to extract mel from vllm-omni output. Output type: {type(output)}")
 
@@ -205,14 +262,46 @@ def echo(req: DiTInferRequest) -> Dict[str, Any]:
     }
 
 
-def _setup_runtime(model_dir: str, num_steps: int, dtype: str):
+def _setup_runtime(
+    model_dir: str, 
+    num_steps: int, 
+    dtype: str,
+    enable_cache_dit: bool = True,
+    cache_dit_fn: int = 8,
+    cache_dit_bn: int = 0,
+    cache_dit_enable_taylorseer: bool = False,
+    cache_dit_taylorseer_order: int = 1,
+    cache_dit_residual_threshold: float = 0.08,
+    enable_cache_logging: Optional[bool] = None,
+    cache_logging_mode: Optional[str] = None,
+):
     global runtime  # noqa: PLW0603
     runtime = VLLMRuntime(
         model_dir=model_dir,
         num_steps=num_steps,
         dtype=dtype,
+        enable_cache_dit=enable_cache_dit,
+        cache_dit_fn=cache_dit_fn,
+        cache_dit_bn=cache_dit_bn,
+        cache_dit_enable_taylorseer=cache_dit_enable_taylorseer,
+        cache_dit_taylorseer_order=cache_dit_taylorseer_order,
+        cache_dit_residual_threshold=cache_dit_residual_threshold,
+        enable_cache_logging=enable_cache_logging,
+        cache_logging_mode=cache_logging_mode,
     )
     print(f"[vllm_server] Ready! (steps={num_steps}, dtype={dtype})")
+    if enable_cache_dit:
+        print(f"[vllm_server] cache-dit 配置: Fn={cache_dit_fn}, Bn={cache_dit_bn}, residual_threshold={cache_dit_residual_threshold}")
+        print(f"[vllm_server] TaylorSeer: enabled={cache_dit_enable_taylorseer}, order={cache_dit_taylorseer_order}")
+    else:
+        print("[vllm_server] cache-dit 已禁用，将执行全量计算。")
+    if cache_logging_mode:
+        print(f"[vllm_server] cache logging mode: {cache_logging_mode}")
+    elif enable_cache_logging is None:
+        print("[vllm_server] cache logging: auto (follows backend settings)")
+    else:
+        log_state = "enabled" if enable_cache_logging else "disabled"
+        print(f"[vllm_server] cache logging forced to {log_state}.")
 
 
 def main():
@@ -222,9 +311,43 @@ def main():
     parser.add_argument("--dtype", type=str, default="float32", choices=["float16", "bfloat16", "float32"], help="Computation dtype")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Server host")
     parser.add_argument("--port", type=int, default=8001, help="Server port")
+    parser.add_argument("--disable-cache-dit", action="store_true", help="禁用 cache-dit 加速")
+    parser.add_argument(
+        "--cache-logging",
+        type=str,
+        choices=["json", "on", "return", "off"],
+        default="return",
+        help="cache 日志行为: off=禁用缓存统计, return=仅返回缓存信息, on=打印信息并返回, json=打印并写json日志",
+    )
+    
+    # cache-dit 配置参数
+    parser.add_argument("--cache-dit-fn", type=int, default=8, help="cache-dit: 计算块数量")
+    parser.add_argument("--cache-dit-bn", type=int, default=0, help="cache-dit: 批处理块数量")
+    parser.add_argument("--cache-dit-enable-taylorseer", action="store_true", default=False, help="cache-dit: 是否启用taylorseer")
+    parser.add_argument("--cache-dit-taylorseer-order", type=int, default=1, help="cache-dit: taylorseer阶数")
+    parser.add_argument("--cache-dit-residual-threshold", type=float, default=0.08, help="cache-dit: 残差差异阈值")
+    
     args = parser.parse_args()
+    cache_logging_mode = args.cache_logging
+    enable_cache_logging = None
+    if args.cache_logging == "json":
+        enable_cache_logging = True
+    elif args.cache_logging == "off":
+        enable_cache_logging = False
 
-    _setup_runtime(args.model_dir, args.num_steps, args.dtype)
+    _setup_runtime(
+        args.model_dir, 
+        args.num_steps, 
+        args.dtype,
+        enable_cache_dit=not args.disable_cache_dit,
+        cache_dit_fn=args.cache_dit_fn,
+        cache_dit_bn=args.cache_dit_bn,
+        cache_dit_enable_taylorseer=args.cache_dit_enable_taylorseer,
+        cache_dit_taylorseer_order=args.cache_dit_taylorseer_order,
+        cache_dit_residual_threshold=args.cache_dit_residual_threshold,
+        enable_cache_logging=enable_cache_logging,
+        cache_logging_mode=cache_logging_mode,
+    )
 
     import uvicorn
     uvicorn.run(app, host=args.host, port=args.port)

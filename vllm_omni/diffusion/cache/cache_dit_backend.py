@@ -38,14 +38,19 @@ def _build_db_cache_config(cache_config: Any) -> DBCacheConfig:
     """
 
     return DBCacheConfig(
-        # we will refresh the context when gets num_inference_steps in the first inference request
-        num_inference_steps=None,
+        # 使用cache_config中的num_inference_steps，确保命令行参数生效
+        num_inference_steps=cache_config.num_inference_steps,
         Fn_compute_blocks=cache_config.Fn_compute_blocks,
         Bn_compute_blocks=cache_config.Bn_compute_blocks,
         max_warmup_steps=cache_config.max_warmup_steps,
         max_cached_steps=cache_config.max_cached_steps,
         max_continuous_cached_steps=cache_config.max_continuous_cached_steps,
         residual_diff_threshold=cache_config.residual_diff_threshold,
+        enable_separate_cfg=False,
+        cfg_compute_first=False,
+        cfg_diff_compute_separate=True,
+        steps_computation_mask=None,
+        steps_computation_policy="dynamic",
     )
 
 

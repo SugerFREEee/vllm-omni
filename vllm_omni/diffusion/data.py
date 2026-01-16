@@ -355,6 +355,10 @@ class OmniDiffusionConfig:
 
     # Logging
     log_level: str = "info"
+    # Allows pipelines to override cache logging behavior (None => pipeline decides)
+    enable_cache_logging: bool | None = None
+    # Optional explicit cache logging mode (off/return/on/json)
+    cache_logging_mode: str | None = None
 
     def settle_port(self, port: int, port_inc: int = 42, max_attempts: int = 100) -> int:
         """

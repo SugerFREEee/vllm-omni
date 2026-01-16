@@ -152,7 +152,7 @@ output = self.omni.generate(
 
 
 
-`CosyVoice3Pipeline` 的 `forward` 方法基本上沿用了CosyVoice原始的推理逻辑
+`CosyVoice3Pipeline` 的 `forward` 方法基本上沿用了CosyVoice原始的推理逻辑，但经过了一些适配以确保与原始实现的一致性：
 
 ```python
 def _forward_inference(self, request: OmniDiffusionRequest) -> DiffusionOutput:
@@ -174,23 +174,30 @@ def _forward_inference(self, request: OmniDiffusionRequest) -> DiffusionOutput:
         if self._t_scheduler == "cosine":
             t_span = 1.0 - torch.cos(t_span * 0.5 * torch.pi)
 
-        # 确定性初始噪声（这种方式确保初始噪声是确定性的，与CosyVoice的 CausalConditionalCFM.rand_noise 用法保持一致）
-        z = self._rand_noise[:, :, :seq_len].to(self.device)
+        # 确定性初始噪声（与CosyVoice的 CausalConditionalCFM.rand_noise 用法保持一致）
+        # 添加温度参数支持
+        temperature = 1.0  # Default temperature
+        z = self._rand_noise[:, :, :seq_len].to(self.device) * temperature
 
-        # 全长度掩码. Match CosyVoice mask shape (B, 1, T).
-        mask = torch.ones((batch_size, 1, seq_len), device=self.device, dtype=torch.float32)
+        # 使用make_pad_mask生成正确的掩码，匹配原始CosyVoice实现
+        # Create token_len_total (assuming no padding in this case)
+        token_len_total = torch.tensor([seq_len], dtype=torch.int32, device=self.device).repeat(batch_size)
+        mask = (~make_pad_mask(token_len_total)).unsqueeze(1).to(self.device)
 
         # 将初始噪声扩展到批次大小
         x = z.expand(batch_size, -1, -1).contiguous()
 
         # 在扩散步骤循环之前预先分配内存，避免在每个步骤中重复创建张量
-        x_in = torch.zeros((2 * batch_size, self.model_config.mel_dim, seq_len), device=self.device, dtype=torch.float32)
-        mask_in = torch.zeros((2 * batch_size, 1, seq_len), device=self.device, dtype=torch.float32)
-        mu_in = torch.zeros((2 * batch_size, self.model_config.mel_dim, seq_len), device=self.device, dtype=torch.float32)
-        t_in = torch.zeros((2 * batch_size,), device=self.device, dtype=torch.float32)
-        spks_in = torch.zeros((2 * batch_size, self.model_config.mel_dim), device=self.device, dtype=torch.float32)
-        cond_in = torch.zeros((2 * batch_size, self.model_config.mel_dim, seq_len), device=self.device, dtype=torch.float32)
+        # 使用输入数据的dtype而不是硬编码float32
+        dtype = mu.dtype if mu is not None else torch.float32
+        x_in = torch.zeros((2 * batch_size, self.model_config.mel_dim, seq_len), device=self.device, dtype=dtype)
+        mask_in = torch.zeros((2 * batch_size, 1, seq_len), device=self.device, dtype=dtype)
+        mu_in = torch.zeros((2 * batch_size, self.model_config.mel_dim, seq_len), device=self.device, dtype=dtype)
+        t_in = torch.zeros((2 * batch_size,), device=self.device, dtype=dtype)
+        spks_in = torch.zeros((2 * batch_size, self.model_config.mel_dim), device=self.device, dtype=dtype)
+        cond_in = torch.zeros((2 * batch_size, self.model_config.mel_dim, seq_len), device=self.device, dtype=dtype)
 
+        # 初始化时间步（与原始CosyVoice保持一致）
         t = t_span[0]
         dt = (t_span[1] - t_span[0]).item()
 
@@ -202,26 +209,55 @@ def _forward_inference(self, request: OmniDiffusionRequest) -> DiffusionOutput:
                 mu_in[:batch_size] = mu            # 只填充前半部分的条件向量
                 spks_in[:batch_size] = spks        # 只填充前半部分的说话人嵌入
                 cond_in[:batch_size] = cond        # 只填充前半部分的条件输入
+                t_in[:] = t                        # 时间步填充所有批次
 
                 # Call the real DiT estimator (signature matches CosyVoice).
-                # self.model = CosyVoice3DiTVllm.from_pretrained(flow_path, config=self.model_config)
-                dphi_dt = self.model.dit(...)
+                dphi_dt = self.model.dit(
+                    x=x_in,
+                    mask=mask_in,
+                    mu=mu_in,
+                    t=t_in,
+                    spks=spks_in,
+                    cond=cond_in,
+                    streaming=False,
+                )
 
-                
                 guided, cfg = torch.split(dphi_dt, [batch_size, batch_size], dim=0)
                 # 引导输出 = 有条件输出 + CFG强度 × (有条件输出 - 无条件输出)
                 guided = (1.0 + self._inference_cfg_rate) * guided - self._inference_cfg_rate * cfg
                 # 使用欧拉方法更新扩散状态
                 x = x + dt * guided
 
-                # 更新当前时间步
-                t = t_span[step]
+                # 更新当前时间步（与原始CosyVoice保持一致）
+                t = t + dt
                 # 计算下一时间步长
                 if step < len(t_span) - 1:
-                    dt = (t_span[step + 1] - t).item()
+                    dt = t_span[step + 1] - t
 
         return DiffusionOutput(output=x.float())
 ```
+
+### 关键适配点
+
+1. **温度参数支持**：
+   - 在初始噪声生成时添加了温度参数：`z = self._rand_noise[:, :, :seq_len].to(self.device) * temperature`
+   - 目前默认值为1.0，可根据需要调整
+
+2. **掩码生成优化**：
+   - 使用 `make_pad_mask` 函数生成正确形状的掩码：`mask = (~make_pad_mask(token_len_total)).unsqueeze(1)`
+   - 掩码形状为 `[batch_size, 1, seq_len]`，与原始CosyVoice保持一致
+
+3. **数据类型处理**：
+   - 使用输入数据的dtype：`dtype = mu.dtype if mu is not None else torch.float32`
+   - 避免硬编码为float32，提高灵活性
+
+4. **时间步计算**：
+   - 使用累积方式更新时间步：`t = t + dt`
+   - 与原始CosyVoice的时间步计算逻辑保持一致
+   - 确保每个时间步的更新与原始实现完全相同
+
+5. **完整的Dit调用**：
+   - 展示了完整的 `self.model.dit()` 调用参数，便于理解实际调用过程
 
 #### 1.2.3 CosyVoice3DiTVllm
 
