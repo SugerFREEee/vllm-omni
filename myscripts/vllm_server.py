@@ -14,12 +14,20 @@ python myscripts/vllm_server.py \
   --cache-dit-residual-threshold 0.4 \
   --cache-logging off
 
+
+python myscripts/vllm_server.py \
+    --model-dir /home/wjs/workspace/model/FunAudioLLM/Fun-CosyVoice3-0.5B-2512 \
+    --num-steps 10 \
+    --max-workers 10 \
+    --disable-cache-dit
 --cache-logging命令行参数有4种 json,on,return,off。off=禁用缓存统计, return=仅返回缓存信息, on=打印信息并返回, json=打印并写json日志
 """
 
 from __future__ import annotations
 
 import argparse
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import os
 import sys
 import time
@@ -32,6 +40,7 @@ import torch
 # 添加ZeroMQ支持
 try:
     import zmq
+    import zmq.asyncio as zmq_async
 except ImportError:
     print("[ERROR] ZeroMQ not installed. Please run 'pip install pyzmq' to enable ZeroMQ support.")
     sys.exit(1)
@@ -224,6 +233,7 @@ class VLLMRuntime:
 
 
 runtime: Optional[VLLMRuntime] = None
+_executor: Optional[ThreadPoolExecutor] = None
 
 
 def _require_runtime() -> VLLMRuntime:
@@ -276,63 +286,60 @@ def _setup_runtime(
         print(f"[vllm_server] cache logging forced to {log_state}.")
 
 
-def run_zmq_server(socket_address):
-    """运行ZeroMQ服务端"""
-    if zmq is None:
-        print("[ERROR] ZeroMQ not available. Please install pyzmq first.")
-        return
+def _serialize_mel(mel: torch.Tensor) -> bytes:
+    import numpy as np
 
-    # 初始化ZeroMQ上下文和套接字
-    context = zmq.Context()
-    socket = context.socket(zmq.ROUTER)  # ROUTER模式支持多客户端
-    
-    # 绑定地址
-    try:
-        socket.bind(socket_address)
-        print(f"[vllm_server] ZeroMQ server started, listening on {socket_address}")
-    except Exception as e:
-        print(f"[ERROR] Failed to bind ZeroMQ socket: {e}")
-        return
+    mel_cpu = mel.detach().to("cpu", non_blocking=True)
+    mel_np = mel_cpu.numpy()
+    response = {
+        "shape": mel_np.shape,
+        "dtype": str(mel_np.dtype),
+        "data": mel_np.tobytes()
+    }
+    return msgpack.packb(response, use_bin_type=True)
 
-    # 处理请求
-    while True:
+
+async def _handle_request(socket, client_id, message, sem: asyncio.Semaphore):
+    async with sem:
         try:
-            # 接收客户端请求（ROUTER模式会收到客户端标识 + 消息体）
-
-            client_id, message = socket.recv_multipart()
             dit_input = msgpack.unpackb(message, raw=False)
-
-            
-            # 模型推理时间
             rt = _require_runtime()
-            mel = rt.infer(dit_input)
-
-            import numpy as np
-            mel_cpu = mel.detach().to("cpu", non_blocking=True)
-            mel_np = mel_cpu.numpy()
-            response = {
-                "shape": mel_np.shape,
-                "dtype": str(mel_np.dtype),
-                "data": mel_np.tobytes()
-            }
-
-            serialized_response = msgpack.packb(response, use_bin_type=True)
-
-            socket.send_multipart([client_id, serialized_response])
-
-            
-            
-            
+            loop = asyncio.get_running_loop()
+            mel = await loop.run_in_executor(_executor, rt.infer, dit_input)
+            serialized_response = _serialize_mel(mel)
+            await socket.send_multipart([client_id, serialized_response])
         except Exception as e:
             print(f"[ERROR] Error handling ZeroMQ request: {e}")
             import traceback
             traceback.print_exc()
-            # 发送错误响应
             try:
                 error_response = {"error": str(e)}
-                socket.send_multipart([client_id, json.dumps(error_response).encode()])
-            except:
+                await socket.send_multipart([client_id, json.dumps(error_response).encode()])
+            except Exception:
                 pass
+
+
+async def run_zmq_server(socket_address, max_workers: int):
+    """运行ZeroMQ服务端（异步 + 线程池推理）"""
+    if zmq is None:
+        print("[ERROR] ZeroMQ not available. Please install pyzmq first.")
+        return
+
+    context = zmq_async.Context()
+    socket = context.socket(zmq.ROUTER)  # ROUTER模式支持多客户端
+
+    try:
+        socket.bind(socket_address)
+        print(f"[vllm_server] ZeroMQ server started, listening on {socket_address}, max_workers={max_workers}")
+    except Exception as e:
+        print(f"[ERROR] Failed to bind ZeroMQ socket: {e}")
+        return
+
+    sem = asyncio.Semaphore(max_workers)
+
+    while True:
+        client_id, message = await socket.recv_multipart()
+        asyncio.create_task(_handle_request(socket, client_id, message, sem))
 
 
 def main():
@@ -358,6 +365,7 @@ def main():
     parser.add_argument("--cache-dit-taylorseer-order", type=int, default=1, help="cache-dit: taylorseer阶数")
     parser.add_argument("--cache-dit-residual-threshold", type=float, default=0.08, help="cache-dit: 残差差异阈值")
     parser.add_argument("--max-warmup-steps", type=int, default=0, help="cache-dit: 最大预热步骤数")
+    parser.add_argument("--max-workers", type=int, default=4, help="ZeroMQ并发处理线程数")
     
     args = parser.parse_args()
     cache_logging_mode = args.cache_logging
@@ -383,7 +391,9 @@ def main():
     )
 
     # 启动ZeroMQ服务端
-    run_zmq_server(args.zmq_address)
+    global _executor  # noqa: PLW0603
+    _executor = ThreadPoolExecutor(max_workers=args.max_workers)
+    asyncio.run(run_zmq_server(args.zmq_address, args.max_workers))
 
 
 if __name__ == "__main__":
